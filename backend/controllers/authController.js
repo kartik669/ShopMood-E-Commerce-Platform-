@@ -1,0 +1,225 @@
+const mongoose = require("mongoose");
+const User = require("../models/User");
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const sendEmail = require("../utils/sendEmail");
+
+const accessTokenSecret =
+  process.env.ACCESS_TOKEN_SECRET || process.env.JWT_SECRET;
+const refreshTokenSecret =
+  process.env.REFRESH_TOKEN_SECRET || process.env.JWT_SECRET;
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+};
+
+const generateAccessToken = (id) => {
+  return jwt.sign({ id }, accessTokenSecret, { expiresIn: "15m" });
+};
+
+const generateRefreshToken = (id) => {
+  return jwt.sign({ id }, refreshTokenSecret, { expiresIn: "7d" });
+};
+
+const getRefreshToken = (req) => {
+  // cookie-parser sets req.cookies; fall back to manual parse for compatibility
+  if (req.cookies && req.cookies.refreshToken) return req.cookies.refreshToken;
+
+  if (req.body && req.body.refreshToken) return req.body.refreshToken;
+
+  const cookieHeader = req.headers.cookie;
+  if (!cookieHeader) return null;
+
+  const cookies = cookieHeader.split(";").reduce((acc, cookie) => {
+    const [key, ...value] = cookie.trim().split("=");
+    acc[key] = decodeURIComponent(value.join("="));
+    return acc;
+  }, {});
+
+  return cookies.refreshToken || null;
+};
+
+const registerUser = async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    if (mongoose.connection.readyState !== 1) {
+      return res.status(503).json({
+        message: "Database is not connected. Please configure a valid MONGODB_URI (e.g. MongoDB Atlas cluster) in backend/.env to register new accounts.",
+      });
+    }
+
+    const userExists = await User.findOne({ email });
+    if (userExists)
+      return res.status(409).json({ message: "User already exists" });
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const user = await User.create({ name, email, password: hashedPassword });
+    if (user) {
+      // Fire-and-forget: don't block response on email delivery
+      if (process.env.GMAIL_USER) {
+        const otp = Math.floor(100000 + Math.random() * 900000);
+        const message = `
+          <h2>Welcome to ShopMood, ${name}!</h2>
+          <p>Thank you for registering on our platform.</p>
+          <p>Your one-time verification/discount OTP is: <strong>${otp}</strong></p>
+        `;
+        sendEmail({
+          email: user.email,
+          subject: "Welcome to ShopMood - Your OTP",
+          message,
+        }).catch((err) => console.error("Welcome email failed:", err.message));
+      }
+
+      res.status(201).json({
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      });
+    } else {
+      res.status(400).json({ message: "Invalid user data" });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const loginUser = async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Resilient fallback when MongoDB is not connected
+    if (mongoose.connection.readyState !== 1) {
+      if (email === "admin@shopmood.com" && password === "password123") {
+        const demoId = "67fc10776358a0393a221b3d";
+        const accessToken = generateAccessToken(demoId);
+        const refreshToken = generateRefreshToken(demoId);
+        res.cookie("refreshToken", refreshToken, cookieOptions);
+        return res.json({
+          _id: demoId,
+          name: "Admin User",
+          email: "admin@shopmood.com",
+          role: "admin",
+          token: accessToken,
+        });
+      }
+      return res.status(503).json({
+        message: "Database is not connected. Use demo credentials (admin@shopmood.com / password123) or set MONGODB_URI in backend/.env.",
+      });
+    }
+
+    const user = await User.findOne({ email });
+
+    if (user && (await bcrypt.compare(password, user.password))) {
+      const accessToken = generateAccessToken(user._id);
+      const refreshToken = generateRefreshToken(user._id);
+
+      user.refreshToken = refreshToken;
+      await user.save();
+
+      res.cookie("refreshToken", refreshToken, cookieOptions);
+
+      res.json({
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        token: accessToken,
+      });
+    } else {
+      res.status(401).json({ message: "Invalid credentials" });
+    }
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const refreshAccessToken = async (req, res) => {
+  try {
+    const refreshToken = getRefreshToken(req);
+    if (!refreshToken)
+      return res.status(401).json({ message: "Refresh token required" });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, refreshTokenSecret);
+    } catch {
+      return res.status(401).json({ message: "Invalid or expired refresh token" });
+    }
+
+    const user = await User.findById(decoded.id);
+
+    if (!user || user.refreshToken !== refreshToken) {
+      return res.status(403).json({ message: "Refresh token revoked or invalid" });
+    }
+
+    res.json({ token: generateAccessToken(user._id) });
+  } catch (error) {
+    res.status(401).json({ message: "Invalid or expired refresh token" });
+  }
+};
+
+const logoutUser = async (req, res) => {
+  try {
+    // Support logout when access token has expired: fall back to cookie token
+    const refreshToken = getRefreshToken(req);
+    if (refreshToken) {
+      try {
+        const decoded = jwt.decode(refreshToken);
+        if (decoded && decoded.id) {
+          const user = await User.findById(decoded.id);
+          if (user && user.refreshToken === refreshToken) {
+            user.refreshToken = undefined;
+            await user.save();
+          }
+        }
+      } catch (_) {
+        // Best-effort: still clear the cookie
+      }
+    } else if (req.user) {
+      const user = await User.findById(req.user._id);
+      if (user) {
+        user.refreshToken = undefined;
+        await user.save();
+      }
+    }
+
+    // Clear the cookie without maxAge so it expires immediately
+    res.clearCookie("refreshToken", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    });
+    res.json({ message: "Logged out successfully" });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+const getMe = async (req, res) => {
+  res.json(req.user);
+};
+
+const getUsers = async (req, res) => {
+  try {
+    const users = await User.find({}).select("-password -refreshToken");
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+module.exports = {
+  registerUser,
+  loginUser,
+  refreshAccessToken,
+  logoutUser,
+  getMe,
+  getUsers,
+};
